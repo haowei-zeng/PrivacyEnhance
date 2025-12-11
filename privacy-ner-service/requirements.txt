@@ -1,0 +1,7 @@
+fastapi==0.114.2
+uvicorn==0.30.6
+pydantic==2.9.2
+spacy==3.7.5
+# Install small models optionally:
+# python -m spacy download en_core_web_sm
+# python -m spacy download zh_core_web_sm

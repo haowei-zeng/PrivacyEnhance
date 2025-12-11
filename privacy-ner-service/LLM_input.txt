@@ -1,0 +1,350 @@
+// ==UserScript==
+// @name         LLM Input Sanitizer (Apply-Then-Send, Soft banner auto-hide, Enter passthrough)
+// @namespace    local.sanitizer
+// @match        *://*/*
+// @all-frames   true
+// @connect      127.0.0.1
+// @connect      localhost
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ===== Backends =====
+  const SANITIZE_URL = "http://127.0.0.1:7070/sanitize";
+  const PROCESS_URL  = "http://127.0.0.1:5050/process";
+
+  // ===== Mode & flags =====
+  const MODES = { SOFT:"soft", AUTO:"auto", CONFIRM:"confirm" };
+  const LS_MODE_KEY = "_san_mode_v2";
+  let MODE = localStorage.getItem(LS_MODE_KEY) || MODES.CONFIRM;
+
+  let DEBUG = false;                // Alt+D
+  let FORCE_INTERCEPT = false;      // Alt+B
+  let backendOK = false;
+
+  // ——“已武装”元素：Alt+S/应用脱敏 后，下一次 Enter 放行原站点发送
+  const armed = new WeakMap(); // el -> { sanitized, bannerEl? }
+  // ——本次按键“通行证”：一次 Enter 的 keydown/keypress/keyup 全部放行
+  let enterPassThrough = false;
+  const setEnterPassThrough = (on) => { enterPassThrough = on; };
+
+  // ===== UI =====
+  GM_addStyle(`
+    ._san_panel { position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
+      background: #fff; border: 1px solid #ddd; box-shadow: 0 6px 24px rgba(0,0,0,.1);
+      border-radius: 12px; width: 440px; max-height: 56vh; overflow: auto; font-family: system-ui, sans-serif; }
+    ._san_header { padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #eee; }
+    ._san_body { padding: 12px; white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; }
+    ._san_tag { display:inline-block; margin:0 6px 6px 0; padding:2px 6px; background:#f6f6f6; border-radius:6px; font-size:12px; }
+    ._san_btns { display:flex; gap:8px; padding: 0 12px 12px; flex-wrap: wrap;}
+    ._san_btn  { padding:6px 10px; border:1px solid #ccc; border-radius:8px; background:#fafafa; cursor:pointer; }
+    ._san_btn:hover { background:#f0f0f0; }
+    ._san_toast{ position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background:#222; color:#fff; padding:8px 12px; border-radius:10px; z-index:2147483647;
+      opacity:0; transition:opacity .18s ease, transform .18s ease; pointer-events:none; font-size:13px; }
+    ._san_toast._show{ opacity:1; transform: translateX(-50%) translateY(-6px); }
+    ._san_fab{ position: fixed; right:16px; bottom: 84px; z-index: 2147483647; padding:8px 12px; border-radius:10px;
+      background:#0b5fff; color:#fff; cursor:pointer; display:none; box-shadow:0 6px 24px rgba(0,0,0,.15); font-size:13px; border:none; }
+    ._san_fab:hover{ filter:brightness(0.95); }
+    ._san_mode{ position: fixed; right:16px; bottom: 134px; z-index: 2147483647; padding:8px 12px; border-radius:10px;
+      background:#ffb400; color:#222; cursor:pointer; display:none; box-shadow:0 6px 24px rgba(0,0,0,.15); font-size:13px; border:none; }
+    ._san_mode:hover{ filter:brightness(0.97); }
+    ._san_banner{ position: fixed; left:50%; bottom: 8px; transform: translateX(-50%);
+      background:#fff6cf; color:#6a5000; border:1px solid #ffe38a; border-radius:10px; padding:6px 10px; z-index:2147483647;
+      font-size:13px; box-shadow:0 6px 18px rgba(0,0,0,.08); }
+  `);
+
+  const log = (...a)=>{ if (DEBUG) console.debug("[SAN]", ...a); };
+  const toast = (msg, ms=1400) => {
+    let t = document.querySelector("._san_toast");
+    if (!t) { t = document.createElement("div"); t.className = "_san_toast"; document.documentElement.appendChild(t); }
+    t.textContent = msg; t.classList.add("_show");
+    setTimeout(()=> t.classList.remove("_show"), ms);
+  };
+
+  function showPanel(title, content, tags=[]) {
+    let box = document.querySelector("._san_panel");
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "_san_panel";
+      box.innerHTML = `
+        <div class="_san_header">LLM Sanitizer</div>
+        <div class="_san_body"></div>
+        <div class="_san_btns">
+          <button class="_san_btn _san_apply">应用脱敏（不发送）</button>
+          <button class="_san_btn _san_close">关闭</button>
+        </div>`;
+      document.documentElement.appendChild(box);
+      box.querySelector("._san_close").onclick = ()=> box.remove();
+    }
+    box.querySelector("._san_header").textContent = title || "LLM Sanitizer";
+    const body = box.querySelector("._san_body");
+    body.innerHTML = "";
+    if (tags && tags.length) {
+      const wrap = document.createElement("div");
+      tags.forEach(t => {
+        const span = document.createElement("span");
+        span.className = "_san_tag"; span.textContent = t;
+        wrap.appendChild(span);
+      });
+      body.appendChild(wrap);
+    }
+    const pre = document.createElement("div");
+    pre.textContent = content || "";
+    body.appendChild(pre);
+    return box;
+  }
+
+  // ===== Banners =====
+  const banners = new Set();
+  function hideAllBanners() {
+    for (const b of banners) try { b.remove(); } catch {}
+    banners.clear();
+  }
+  function hideBannerFor(el) {
+    const info = armed.get(el);
+    if (info?.bannerEl) { try { info.bannerEl.remove(); } catch {} }
+    if (info) info.bannerEl = null;
+  }
+
+  // ===== DOM helpers =====
+  function pickEditableFromEvent(e){
+    const path = e && e.composedPath ? e.composedPath() : (e ? [e.target] : []);
+    for (const n of path) {
+      if (!n || n.nodeType !== 1) continue;
+      const el = n;
+      const tag = el.tagName;
+      const isInput = (tag === "INPUT") && ["text","search","email","url","number","tel"].includes(el.type || "");
+      if (isInput || tag === "TEXTAREA" || el.isContentEditable || el.getAttribute?.("role")==="textbox") return el;
+    }
+    const ae = document.activeElement;
+    if (ae && ae.nodeType === 1) {
+      const el = ae;
+      const tag = el.tagName;
+      if (el.isContentEditable || el.getAttribute?.("role")==="textbox") return el;
+      if (tag === "TEXTAREA") return el;
+      if (tag === "INPUT" && ["text","search","email","url","number","tel"].includes(el.type || "")) return el;
+    }
+    return null;
+  }
+  const getInput = (el)=>{
+    if (!el) return "";
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || (tag === "INPUT" && ["text","search","email","url","number","tel"].includes(el.type))) {
+      return el.value || "";
+    }
+    if (el.isContentEditable || el.getAttribute?.("role")==="textbox") return el.innerText || el.textContent || "";
+    return "";
+  };
+  const setInput = (el, val)=>{
+    if (!el) return;
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || (tag === "INPUT" && ["text","search","email","url","number","tel"].includes(el.type))) {
+      el.value = val;
+      el.dispatchEvent(new Event("input", {bubbles:true}));
+      el.dispatchEvent(new Event("change", {bubbles:true}));
+    } else {
+      el.textContent = val;
+      el.dispatchEvent(new Event("input", {bubbles:true}));
+    }
+  };
+
+  // ===== Backend =====
+  function postSanitize(text, cb) {
+    GM_xmlhttpRequest({
+      method: "POST",
+      url: SANITIZE_URL,
+      headers: {"Content-Type":"application/json"},
+      data: JSON.stringify({text}),
+      timeout: 7000,
+      onload: r => { try { cb(JSON.parse(r.responseText)); } catch { cb(null); } },
+      onerror: () => cb(null),
+      ontimeout: ()=> cb(null)
+    });
+  }
+  function postProcess(sanitizedText, cb) {
+    GM_xmlhttpRequest({
+      method: "POST",
+      url: PROCESS_URL,
+      headers: {"Content-Type":"application/json"},
+      data: JSON.stringify({text: sanitizedText}),
+      onload: r => { try { cb(JSON.parse(r.responseText)); } catch { cb({output:r.responseText}); } },
+      onerror: () => cb({error: "process failed"})
+    });
+  }
+
+  // ===== Mode toggle UI =====
+  const modeBtn = document.createElement("button");
+  modeBtn.className = "_san_mode";
+  const refreshModeBtn = ()=> modeBtn.textContent = `模式：${MODE===MODES.SOFT?"Soft":MODE===MODES.AUTO?"Auto":"Confirm"}（Alt+1/2/3）`;
+  modeBtn.onclick = ()=>{
+    MODE = MODE===MODES.SOFT ? MODES.AUTO : MODE===MODES.AUTO ? MODES.CONFIRM : MODES.SOFT;
+    localStorage.setItem(LS_MODE_KEY, MODE); refreshModeBtn(); hideAllBanners(); toast(`模式：${MODE}`);
+  };
+  refreshModeBtn();
+
+  // ===== FAB =====
+  const fab = document.createElement("button");
+  fab.className = "_san_fab";
+  fab.textContent = "脱敏（仅替换，不发送）(Alt+S)";
+
+  document.addEventListener('DOMContentLoaded', () => {
+    (document.body || document.documentElement).appendChild(fab);
+    (document.body || document.documentElement).appendChild(modeBtn);
+  });
+
+  // 软黄条：创建并登记（以便自动清理）
+  function makeSoftBanner(text){
+    const banner = document.createElement("div");
+    banner.className = "_san_banner";
+    banner.textContent = text;
+    document.documentElement.appendChild(banner);
+    banners.add(banner);
+    return banner;
+  }
+
+  let lastEditable = null;
+  window.addEventListener("focusin", (e)=>{
+    const el = pickEditableFromEvent(e) || e.target;
+    if (!el) return;
+    lastEditable = el;
+    fab.style.display = "block";
+    modeBtn.style.display = "block";
+  }, true);
+  window.addEventListener("focusout", (e)=>{
+    // 失焦时清理与该输入框关联的黄条
+    const el = pickEditableFromEvent(e) || e.target;
+    if (el) hideBannerFor(el);
+    setTimeout(()=> {
+      if (document.activeElement !== lastEditable) { fab.style.display = "none"; modeBtn.style.display = "none"; }
+    }, 50);
+  }, true);
+
+  // ===== Prepare only (no send) =====
+  function armWithSanitized(el, sanitized, tags, softText){
+    setInput(el, sanitized);
+
+    // 设置软黄条（Soft 模式常驻，直到切换模式/再次 Alt+S / Esc / 失焦）
+    hideBannerFor(el);
+    if (softText) {
+      const banner = makeSoftBanner(softText + "（已替换为脱敏文本，按 Enter 发送）");
+      const info = armed.get(el) || {};
+      info.bannerEl = banner;
+      armed.set(el, info);
+    } else {
+      toast("已应用脱敏（不发送），按 Enter 发送");
+    }
+
+    // 标记为“已武装”
+    const info = armed.get(el) || {};
+    info.sanitized = sanitized;
+    armed.set(el, info);
+  }
+
+  function runSanitizeAndPrepare(el){
+    const raw = getInput(el);
+    if (!raw.trim()) return;
+    postSanitize(raw, (res)=>{
+      if (!res) { toast("后端不可用：未替换"); return; }
+      const tags = (res.findings||[]).map(f=>f.label);
+      const sanitized = res.sanitized || raw;
+      if (!tags.length || raw === sanitized) { toast("未检测到敏感项"); return; }
+
+      if (MODE === MODES.SOFT) {
+        armWithSanitized(el, sanitized, tags, `Soft prompt: 检测到敏感项（${tags.join(", ")}）`);
+        return;
+      }
+      if (MODE === MODES.AUTO) {
+        armWithSanitized(el, sanitized, tags, null);
+        return;
+      }
+      // Confirm：面板里“应用脱敏（不发送）”
+      const box = showPanel("检测到敏感信息：是否应用脱敏？（不发送）", sanitized, tags);
+      box.querySelector("._san_apply").onclick = function(){
+        armWithSanitized(el, sanitized, tags, null);
+        box.remove();
+      };
+    });
+  }
+
+  fab.onclick = ()=> (lastEditable || document.activeElement) && runSanitizeAndPrepare(lastEditable || document.activeElement);
+
+  // ===== Hotkeys =====
+  window.addEventListener("keydown", (e)=>{
+    const k = String(e.key).toLowerCase();
+    if (e.altKey && k==='s') {
+      e.preventDefault();
+      hideAllBanners();                    // 再次 Alt+S 时先清理旧黄条
+      const el = pickEditableFromEvent(e) || document.activeElement || lastEditable;
+      if (el) runSanitizeAndPrepare(el);
+    }
+    if (e.altKey && k==='d') { DEBUG=!DEBUG; toast(`Debug ${DEBUG?"ON":"OFF"}`); }
+    if (e.altKey && k==='b') { FORCE_INTERCEPT=!FORCE_INTERCEPT; toast(`ForceIntercept ${FORCE_INTERCEPT?"ON":"OFF"}`); }
+    if (e.altKey && (k==='1'||k==='2'||k==='3')) {
+      MODE = (k==='1')?MODES.SOFT:(k==='2')?MODES.AUTO:MODES.CONFIRM;
+      localStorage.setItem(LS_MODE_KEY, MODE);
+      refreshModeBtn(); hideAllBanners(); toast(`模式：${MODE}`);
+    }
+    if (k==='escape') { hideAllBanners(); }  // Esc 也会收起黄条
+  }, true);
+
+  // ===== Boot ping =====
+  const bootPing = ()=> postSanitize("boot ping", (res)=>{ backendOK = !!res; toast(backendOK ? "Sanitizer OK" : "Sanitizer not reachable"); });
+  setTimeout(bootPing, 400);
+  document.addEventListener('DOMContentLoaded', ()=> { if (!backendOK) setTimeout(bootPing, 300); });
+
+  // ===== Enter interception =====
+  function interceptEnter(e){
+    if (e.key !== 'Enter') return;
+
+    // 如果本次 Enter 已开启“通行证”，直接放行（keydown/keypress/keyup 全部）
+    if (enterPassThrough) return;
+
+    const el = pickEditableFromEvent(e) || document.activeElement;
+    if (!el) return;
+
+    // 若该输入框“已武装”：启动一次性通行证，直到本次 Enter 的 keyup
+    if (armed.has(el)) {
+      setEnterPassThrough(true);
+      // keyup 时清理武装与黄条，并关闭通行证
+      const onKeyUp = (ev)=>{
+        if (ev.key === 'Enter') {
+          hideBannerFor(el);
+          armed.delete(el);
+          setEnterPassThrough(false);
+          window.removeEventListener('keyup', onKeyUp, true);
+          document.removeEventListener('keyup', onKeyUp, true);
+          try { (unsafeWindow||window).removeEventListener('keyup', onKeyUp, true); } catch {}
+        }
+      };
+      window.addEventListener('keyup', onKeyUp, true);
+      document.addEventListener('keyup', onKeyUp, true);
+      try { (unsafeWindow||window).addEventListener('keyup', onKeyUp, true); } catch {}
+      return; // 关键：不 preventDefault，放行站点原生发送
+    }
+
+    // 正常拦截（未武装时才会走到这里）
+    if (window.__SAN_BYPASS) return;
+    if (!(FORCE_INTERCEPT || backendOK)) return;
+    if (e.shiftKey) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    e.cancelBubble = true; e.returnValue = false;
+
+    // 我们的默认策略：拦截后不直接发，而是准备好（替换），等用户再按一次 Enter
+    runSanitizeAndPrepare(el);
+  }
+
+  ['keydown','keypress','keyup'].forEach(t=>{
+    window.addEventListener(t, interceptEnter, true);
+    document.addEventListener(t, interceptEnter, true);
+    try { (unsafeWindow||window).addEventListener(t, interceptEnter, true); } catch {}
+  });
+
+})();
